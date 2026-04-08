@@ -87,14 +87,20 @@ with tab1:
 with tab2:
     st.header("Global Model Performance Diagnostics")
     
-    # Check if we have data to plot (Adjust paths if running from a different directory)
-    model_path = "../models/registry/NiTi_Family.pkl"
-    data_path = "../data/niti_dummy_data.csv"
+    # --- SMART PATH RESOLUTION ---
+    current_dir = os.getcwd()
     
-    # Fallback paths just in case Streamlit is run from the root directory instead of the frontend folder
-    if not os.path.exists(model_path):
-        model_path = "models/registry/NiTi_Family.pkl"
-        data_path = "data/niti_dummy_data.csv"
+    model_path = os.path.join(current_dir, "models", "registry", "NiTi_Family.pkl")
+    data_path = os.path.join(current_dir, "data", "niti_data.csv")
+    
+    if not os.path.exists(model_path) or not os.path.exists(data_path):
+        parent_dir = os.path.dirname(current_dir)
+        model_path = os.path.join(parent_dir, "models", "registry", "NiTi_Family.pkl")
+        data_path = os.path.join(parent_dir, "data", "niti_data.csv")
+
+    with st.expander("🛠️ Debug File Paths (Click to view)"):
+        st.write(f"**Looking for Model at:** `{model_path}` (Exists: {os.path.exists(model_path)})")
+        st.write(f"**Looking for Data at:** `{data_path}` (Exists: {os.path.exists(data_path)})")
 
     if os.path.exists(model_path) and os.path.exists(data_path):
         try:
@@ -102,19 +108,35 @@ with tab2:
             model = joblib.load(model_path)
             df = pd.read_csv(data_path)
             
-            # Predict on the dataset
-            X = df.drop(columns=['AF', 'AS', 'MF', 'MS', 'TSPAN'], errors='ignore')
+            # --- DEFINE FEATURES EXPLICITLY (Matches your training script) ---
+            features = ['Ag', 'Al', 'Au', 'Cd', 'Co', 'Cu', 'Fe', 'Hf', 'Mn', 'Nb', 
+                        'Ni', 'Pd', 'Pt', 'Ru', 'Si', 'Ta', 'Ti', 'Zn', 'Zr', 
+                        'Cooling_Rate', 'Heating_Rate', 'Density']
+            
+            # Fill missing features with 0.0 to prevent dataframe alignment errors
+            for feat in features:
+                if feat not in df.columns:
+                    df[feat] = 0.0
+                    
+            X = df[features]
+            
+            # Targets based on your training script: ['AF', 'AS', 'MF', 'MS']
             y_actual = df[['AF', 'AS', 'MF', 'MS']]
             y_pred = model.predict(X)
             
+            # --- DIG INTO THE PIPELINE ---
+            # 1. Get the MultiOutputRegressor
+            multi_regressor = model.named_steps['regressor']
+            # 2. Get the first underlying RandomForest (used for AF)
+            rf_model = multi_regressor.estimators_[0]
+            
             # --- 1. Model Architecture Metadata ---
             st.subheader("1. Architecture & Training Data")
-            rf_estimator = model.named_steps['regressor'].estimators_[0]
             
             m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-            m_col1.metric("Algorithm", "Random Forest")
-            m_col2.metric("Decision Trees", rf_estimator.n_estimators)
-            m_col3.metric("Input Features", rf_estimator.n_features_in_)
+            m_col1.metric("Algorithm", "Random Forest (Multi-Output Pipeline)")
+            m_col2.metric("Decision Trees", rf_model.n_estimators) # Fixed extraction
+            m_col3.metric("Input Features", len(features))
             m_col4.metric("Dataset Size", f"{len(df)} rows")
             
             st.divider()
@@ -122,17 +144,17 @@ with tab2:
             # --- 2. Advanced Error Metrics ---
             st.subheader("2. Austenite Finish (AF) Accuracy Metrics")
             
-            # Calculate metrics
+            # Calculate metrics (Index 0 is AF)
             mae_af = mean_absolute_error(y_actual['AF'], y_pred[:, 0])
             rmse_af = np.sqrt(mean_squared_error(y_actual['AF'], y_pred[:, 0]))
             max_err_af = max_error(y_actual['AF'], y_pred[:, 0])
             r2_af = r2_score(y_actual['AF'], y_pred[:, 0])
             
             e_col1, e_col2, e_col3, e_col4 = st.columns(4)
-            e_col1.metric("Mean Absolute Error (MAE)", f"± {mae_af:.2f} °C", help="Average error magnitude")
-            e_col2.metric("Root Mean Squared Error", f"± {rmse_af:.2f} °C", help="Penalizes larger errors more heavily")
-            e_col3.metric("Max Error (Worst Case)", f"{max_err_af:.2f} °C", help="The single most inaccurate prediction in the dataset")
-            e_col4.metric("R² Score", f"{r2_af:.3f}", help="1.0 is a perfect prediction model")
+            e_col1.metric("Mean Absolute Error (MAE)", f"± {mae_af:.2f} °C")
+            e_col2.metric("Root Mean Squared Error", f"± {rmse_af:.2f} °C")
+            e_col3.metric("Max Error (Worst Case)", f"{max_err_af:.2f} °C")
+            e_col4.metric("R² Score", f"{r2_af:.3f}")
             
             st.divider()
             
@@ -153,6 +175,7 @@ with tab2:
             # Graph 2: Parity Plot (MF)
             with col2:
                 fig2, ax2 = plt.subplots(figsize=(6, 4))
+                # Fixed Indexing: MF is at index 2 in your TARGETS array
                 sns.scatterplot(x=y_actual['MF'], y=y_pred[:, 2], alpha=0.6, color='orange', ax=ax2)
                 ax2.plot([y_actual['MF'].min(), y_actual['MF'].max()], [y_actual['MF'].min(), y_actual['MF'].max()], 'r--')
                 ax2.set_title("Parity Plot: Martensite Finish (MF)")
@@ -162,13 +185,14 @@ with tab2:
 
             # Graph 3: Feature Importance
             with col1:
-                importances = rf_estimator.feature_importances_
-                feat_names = X.columns
-                importance_df = pd.DataFrame({"Feature": feat_names, "Importance": importances}).sort_values(by="Importance", ascending=False).head(10)
+                # Average feature importance across all 4 target models in the MultiOutputRegressor
+                importances = np.mean([est.feature_importances_ for est in multi_regressor.estimators_], axis=0)
+                
+                importance_df = pd.DataFrame({"Feature": features, "Importance": importances}).sort_values(by="Importance", ascending=False).head(10)
                 
                 fig3, ax3 = plt.subplots(figsize=(6, 4))
                 sns.barplot(data=importance_df, x="Importance", y="Feature", hue="Feature", legend=False, palette="viridis", ax=ax3)
-                ax3.set_title("Top 10 Feature Importances")
+                ax3.set_title("Top 10 Feature Importances (Averaged)")
                 ax3.set_xlabel("Relative Importance")
                 st.pyplot(fig3)
 
@@ -183,6 +207,7 @@ with tab2:
                 st.pyplot(fig4)
 
         except Exception as e:
-            st.warning(f"Could not generate graphs. Error: {e}")
+            st.error(f"Could not generate graphs. The following error occurred:")
+            st.exception(e) 
     else:
-        st.warning("Model or data files not found. Ensure you have run train_initial.py.")
+        st.error("❌ Model or data files not found. Please expand the 'Debug File Paths' section above to see where Streamlit is searching.")
